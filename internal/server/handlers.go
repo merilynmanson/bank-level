@@ -8,21 +8,40 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const kopeksInRub = 100
+
 func (s *Server) transferMoney(ctx *gin.Context) {
 	var transData transaction
 	ctx.BindJSON(&transData)
 
-	err := s.accStorage.SubtractMoney(transData.Sender, transData.Sum)
-	if err != nil {
+	if transData.Sum < 0 {
 		ctx.IndentedJSON(http.StatusBadRequest, gin.H{
-			"description": "sender's account not found",
+			"description": "negative sum to transfer",
 		})
 		return
 	}
-	err = s.accStorage.AddMoney(transData.Receiver, transData.Sum)
+
+	s.accStorage.Lock()
+	defer s.accStorage.Unlock()
+
+	sumToTransfer := uint(transData.Sum * kopeksInRub) // Rubles to kopeks
+
+	err := s.accStorage.SubtractMoney(transData.Sender, sumToTransfer)
 	if err != nil {
 		ctx.IndentedJSON(http.StatusBadRequest, gin.H{
-			"description": "receiver's account not found",
+			"description": "incorrect request's data",
+		})
+		return
+	}
+
+	err = s.accStorage.AddMoney(transData.Receiver, sumToTransfer)
+	if err != nil {
+		// If we can't increase the receiver's balance, we "return" money to sender.
+		// We do that as this point is reachable in case when we have already taken
+		// sender's money away. Kind of "rollback".
+		s.accStorage.AddMoney(transData.Sender, sumToTransfer)
+		ctx.IndentedJSON(http.StatusBadRequest, gin.H{
+			"description": "incorrect request's data",
 		})
 		return
 	}
@@ -30,7 +49,6 @@ func (s *Server) transferMoney(ctx *gin.Context) {
 	ctx.IndentedJSON(http.StatusOK, gin.H{
 		"description": "transaction successfuly completed",
 	})
-	s.accStorage.PrintAccs()
 }
 
 func (s *Server) createAccount(ctx *gin.Context) {
@@ -44,8 +62,12 @@ func (s *Server) createAccount(ctx *gin.Context) {
 		})
 		return
 	}
+	s.accStorage.RLock()
+	defer s.accStorage.RUnlock()
 
-	s.accStorage.AddAccount(regData.Money)
+	accountMoney := uint(regData.Money * kopeksInRub)
+
+	s.accStorage.AddAccount(accountMoney)
 	ctx.IndentedJSON(http.StatusCreated, gin.H{
 		"description": "account was successfuly created",
 	})
@@ -58,10 +80,18 @@ func (s *Server) getAccount(ctx *gin.Context) {
 		ctx.IndentedJSON(http.StatusBadRequest, gin.H{"description": "incorrect id parameter"})
 		return
 	}
+
+	s.accStorage.RLock()
+	defer s.accStorage.RUnlock()
 	account, ok := s.accStorage.GetAccount(uint(id))
 	if !ok {
 		ctx.IndentedJSON(http.StatusNotFound, gin.H{"description": "account not found"})
 		return
 	}
-	ctx.IndentedJSON(http.StatusOK, *account)
+
+	accForResponse := AccountForResponse{
+		Id:    account.GetId(),
+		Money: float32(account.GetMoney()) / kopeksInRub,
+	}
+	ctx.IndentedJSON(http.StatusOK, accForResponse)
 }
